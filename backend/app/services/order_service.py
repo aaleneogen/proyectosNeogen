@@ -1,19 +1,13 @@
-"""
-Orchestrates the full order processing pipeline:
-upload → parse → match → persist
-"""
-import shutil
 from pathlib import Path
 from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select
 
-from app.models.models import PurchaseOrder, OrderLine, OrderStatus, MatchConfidence
+from app.models.models import PurchaseOrder, OrderLine, OrderStatus, MatchConfidence, LineStatus
 from app.schemas.schemas import ProcessingResult
 from app.services.parser_service import parse_document
 from app.services.matching_service import match_product
-from app.core.config import settings
 
 import logging
 logger = logging.getLogger(__name__)
@@ -46,9 +40,10 @@ async def process_order(order_id: str, file_path: str, file_type: str, db: Async
             if row.unit_price is None:
                 warnings.append("Missing price")
 
+            quantity_ordered = row.quantity or 0
             is_valid = (
                 match.sku is not None
-                and row.quantity is not None
+                and quantity_ordered > 0
                 and match.confidence != MatchConfidence.NONE
             )
 
@@ -60,13 +55,16 @@ async def process_order(order_id: str, file_path: str, file_type: str, db: Async
                 raw_price=row.raw_price,
                 matched_sku=match.sku,
                 matched_description=match.description,
-                quantity=row.quantity,
+                quantity_ordered=quantity_ordered,
+                quantity_delivered=0,
+                quantity_pending=quantity_ordered,
                 unit_price=match.price,
                 confidence=match.confidence,
                 confidence_score=match.confidence_score,
                 match_method=match.match_method,
                 warnings=warnings,
                 is_valid=is_valid,
+                line_status=LineStatus.PENDING,
                 product_id=match.product_id,
             )
             order_lines.append(line)

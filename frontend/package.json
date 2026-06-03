@@ -1,6 +1,6 @@
 {
-  "name": "neogen-sap-converter",
-  "version": "1.0.0",
+  "name": "neogen-eleco-portal",
+  "version": "2.0.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -17,20 +17,14 @@
     "axios": "^1.7.2",
     "lucide-react": "^0.383.0",
     "react-dropzone": "^14.2.3",
+    "recharts": "^2.12.7",
     "date-fns": "^3.6.0",
     "clsx": "^2.1.1",
     "tailwind-merge": "^2.3.0",
     "class-variance-authority": "^0.7.0",
-    "@radix-ui/react-dialog": "^1.0.5",
-    "@radix-ui/react-select": "^2.0.0",
-    "@radix-ui/react-tooltip": "^1.0.7",
-    "@radix-ui/react-badge": "^1.0.0",
-    "@radix-ui/react-progress": "^1.0.3",
-    "@radix-ui/react-separator": "^1.0.3",
-    "@radix-ui/react-label": "^2.0.2",
-    "@radix-ui/react-slot": "^1.0.2",
+    "zustand": "^4.5.2",
     "sonner": "^1.5.0",
-    "zustand": "^4.5.2"
+    "@radix-ui/react-slot": "^1.0.2"
   },
   "devDependencies": {
     "typescript": "^5",

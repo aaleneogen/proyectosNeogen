@@ -8,14 +8,16 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Backgro
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from sqlalchemy.orm import selectinload
 
 from app.db.database import get_db
-from app.models.models import PurchaseOrder, OrderLine, OrderStatus
+from app.models.models import PurchaseOrder, OrderLine, OrderStatus, User, UserRole
 from app.schemas.schemas import (
     PurchaseOrderOut, PurchaseOrderSummary, OrderLineOut, OrderLineUpdate, ProcessingResult
 )
 from app.services.order_service import process_order
 from app.services.export_service import export_order_to_excel
+from app.core.security import get_current_user, require_admin
 from app.core.config import settings
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -30,8 +32,8 @@ ALLOWED_TYPES = {
 
 @router.post("/upload", response_model=ProcessingResult)
 async def upload_order(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     content_type = file.content_type or ""
@@ -63,12 +65,19 @@ async def upload_order(
                 raise HTTPException(413, f"File exceeds {settings.MAX_UPLOAD_SIZE_MB}MB limit")
             await f.write(chunk)
 
+    # Generate order number
+    count_result = await db.execute(select(func.count()).select_from(PurchaseOrder))
+    count = (count_result.scalar() or 0) + 1
+    order_number = f"OC-{datetime.now().year}-{count:04d}"
+
     order = PurchaseOrder(
         id=order_id,
+        order_number=order_number,
         original_filename=file.filename or safe_filename,
         file_path=str(file_path),
         file_type=ext,
         status=OrderStatus.PENDING,
+        created_by_id=current_user.id,
     )
     db.add(order)
     await db.commit()
@@ -78,41 +87,56 @@ async def upload_order(
 
 
 @router.get("/", response_model=list[PurchaseOrderSummary])
-async def list_orders(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(PurchaseOrder).order_by(PurchaseOrder.created_at.desc()).limit(100)
-    )
+async def list_orders(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(PurchaseOrder).order_by(PurchaseOrder.created_at.desc()).limit(200)
+    if current_user.role == UserRole.ELECO:
+        query = query.where(PurchaseOrder.created_by_id == current_user.id)
+
+    result = await db.execute(query)
     orders = result.scalars().all()
+
     summaries = []
     for o in orders:
-        line_result = await db.execute(
-            select(func.count()).where(OrderLine.order_id == o.id)
+        lines_result = await db.execute(
+            select(OrderLine).where(OrderLine.order_id == o.id)
         )
-        line_count = line_result.scalar() or 0
+        lines = lines_result.scalars().all()
         summaries.append(PurchaseOrderSummary(
             id=o.id,
+            order_number=o.order_number,
             original_filename=o.original_filename,
             status=o.status,
             distributor=o.distributor,
             created_at=o.created_at,
-            line_count=line_count,
+            line_count=len(lines),
+            lines_pending=sum(1 for l in lines if l.line_status.value == "pending"),
+            lines_completed=sum(1 for l in lines if l.line_status.value == "completed"),
         ))
     return summaries
 
 
 @router.get("/{order_id}", response_model=PurchaseOrderOut)
-async def get_order(order_id: str, db: AsyncSession = Depends(get_db)):
+async def get_order(
+    order_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(
-        select(PurchaseOrder).where(PurchaseOrder.id == order_id)
+        select(PurchaseOrder)
+        .where(PurchaseOrder.id == order_id)
+        .options(selectinload(PurchaseOrder.lines).selectinload(OrderLine.deliveries))
     )
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(404, "Order not found")
 
-    lines_result = await db.execute(
-        select(OrderLine).where(OrderLine.order_id == order_id).order_by(OrderLine.row_index)
-    )
-    order.lines = lines_result.scalars().all()
+    # ELECO can only see their own orders
+    if current_user.role == UserRole.ELECO and order.created_by_id != current_user.id:
+        raise HTTPException(403, "Access denied")
+
     return order
 
 
@@ -121,10 +145,13 @@ async def update_line(
     order_id: str,
     line_id: str,
     data: OrderLineUpdate,
+    current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        select(OrderLine).where(OrderLine.id == line_id, OrderLine.order_id == order_id)
+        select(OrderLine)
+        .where(OrderLine.id == line_id, OrderLine.order_id == order_id)
+        .options(selectinload(OrderLine.deliveries))
     )
     line = result.scalar_one_or_none()
     if not line:
@@ -133,8 +160,12 @@ async def update_line(
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(line, field, value)
 
+    # Recalculate pending when quantity_ordered changes
+    if data.quantity_ordered is not None:
+        line.quantity_pending = max(0, data.quantity_ordered - (line.quantity_delivered or 0))
+
     line.manually_reviewed = True
-    if line.matched_sku and line.quantity is not None:
+    if line.matched_sku and line.quantity_ordered:
         line.is_valid = True
 
     await db.commit()
@@ -142,23 +173,44 @@ async def update_line(
     return line
 
 
+@router.post("/{order_id}/approve", response_model=PurchaseOrderOut)
+async def approve_order(
+    order_id: str,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(PurchaseOrder).where(PurchaseOrder.id == order_id))
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(404, "Order not found")
+    order.status = OrderStatus.APPROVED
+    await db.commit()
+
+    full = await db.execute(
+        select(PurchaseOrder)
+        .where(PurchaseOrder.id == order_id)
+        .options(selectinload(PurchaseOrder.lines).selectinload(OrderLine.deliveries))
+    )
+    return full.scalar_one()
+
+
 @router.post("/{order_id}/export")
-async def export_order(order_id: str, db: AsyncSession = Depends(get_db)):
+async def export_order(
+    order_id: str,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(
-        select(PurchaseOrder).where(PurchaseOrder.id == order_id)
+        select(PurchaseOrder)
+        .where(PurchaseOrder.id == order_id)
+        .options(selectinload(PurchaseOrder.lines))
     )
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(404, "Order not found")
 
-    lines_result = await db.execute(
-        select(OrderLine).where(OrderLine.order_id == order_id).order_by(OrderLine.row_index)
-    )
-    order.lines = lines_result.scalars().all()
-
     try:
         file_path = export_order_to_excel(order)
-        order.status = OrderStatus.COMPLETED
         order.exported_at = datetime.utcnow()
         order.export_path = file_path
         await db.commit()
